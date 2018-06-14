@@ -226,8 +226,8 @@ impl SnapshotCommand {
 
 			// attempting restoration with recovery will lead to deadlock
 			// as we currently hold a read lock on the service's reader.
-			match *snapshot.reader() {
-				Some(ref reader) => restore_using(snapshot.clone(), reader, false)?,
+			match snapshot.instance().as_ref() {
+				Some(ref snap_instance) => restore_using(snapshot.clone(), snap_instance.reader(), false)?,
 				None => return Err("No local snapshot found.".into()),
 			}
 		}

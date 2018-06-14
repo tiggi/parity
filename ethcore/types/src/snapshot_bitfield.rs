@@ -19,7 +19,7 @@ use bytes::Bytes;
 use ethereum_types::H256;
 use rlp::{Rlp, RlpStream, DecoderError};
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::iter::FromIterator;
 
 #[derive(Clone)]
@@ -70,8 +70,10 @@ impl BitfieldCompletion {
 
 #[derive(Clone)]
 pub struct Bitfield {
+	/// The current completion of this Bitfield
 	completion: BitfieldCompletion,
-	hashes: Vec<H256>,
+	/// HashMap between the hashes and their index
+	hashes: HashMap<H256, usize>,
 }
 
 impl Bitfield {
@@ -103,8 +105,8 @@ impl Bitfield {
 			return Err(DecoderError::RlpIncorrectListLen);
 		}
 
-		for (index, hash) in hashes.iter().enumerate() {
-			if BitfieldCompletion::is_available(index, &raw_bytes) {
+		for (hash, index) in hashes.iter() {
+			if BitfieldCompletion::is_available(*index, &raw_bytes) {
 				available_chunks.insert(*hash);
 			}
 		}
@@ -114,30 +116,38 @@ impl Bitfield {
 
 	/// Read the given Manifest file to collect the bytes length
 	/// and the corresponding hashes
-	pub fn read_manifest(manifest: &ManifestData) -> (Vec<H256>, usize) {
-		let hashes = manifest.block_hashes
+	pub fn read_manifest(manifest: &ManifestData) -> (HashMap<H256, usize>, usize) {
+		let hashes: HashMap<H256, usize> = manifest.block_hashes
 			.iter()
 			.chain(manifest.state_hashes.iter())
-			.map(|h| *h)
-			.collect::<Vec<H256>>();
+			.enumerate()
+			.map(|(index, h)| (*h, index))
+			.collect();
 
 		let length = (hashes.len() as f64 / 8 as f64).ceil() as usize;
 		(hashes, length)
 	}
 
+	/// Returns whether the given chunk is available
+	pub fn is_available(&self, hash: H256) -> bool {
+		self.hashes.get(&hash).map_or(false, |index| {
+			BitfieldCompletion::is_available(*index, &self.completion.bytes)
+		})
+	}
+
 	/// Returns a HashSet of available chunks
 	pub fn available_chunks(&self) -> HashSet<H256> {
-		let iter = self.hashes.iter().enumerate()
-			.filter(|(i, _)| BitfieldCompletion::is_available(*i, &self.completion.bytes))
-			.map(|(_, h)| *h);
+		let iter = self.hashes.iter()
+			.filter(|&(_, i)| BitfieldCompletion::is_available(*i, &self.completion.bytes))
+			.map(|(h, _)| *h);
 		HashSet::from_iter(iter)
 	}
 
 	/// Returns a HashSet of needed chunks
 	pub fn needed_chunks(&self) -> HashSet<H256> {
-		let iter = self.hashes.iter().enumerate()
-			.filter(|(i, _)| !BitfieldCompletion::is_available(*i, &self.completion.bytes))
-			.map(|(_, h)| *h);
+		let iter = self.hashes.iter()
+			.filter(|&(_, i)| !BitfieldCompletion::is_available(*i, &self.completion.bytes))
+			.map(|(h, _)| *h);
 		HashSet::from_iter(iter)
 	}
 
@@ -149,24 +159,22 @@ impl Bitfield {
 	/// Mark one hash as completed
 	pub fn mark_one(&mut self, hash: &H256) {
 		// Find the index of the completed hash
-		if let Some(index) = self.hashes.iter().position(|&h| h == *hash) {
-			self.completion.mark(index);
+		if let Some(index) = self.hashes.get(hash) {
+			self.completion.mark(*index);
 		}
 	}
 
 	/// Mark some hashes as completed
 	pub fn mark_some(&mut self, completed_hashes: &HashSet<H256>) {
-		for (index, hash) in self.hashes.iter().enumerate() {
-			if completed_hashes.contains(&hash) {
-				self.completion.mark(index);
-			}
+		for hash in completed_hashes.iter() {
+			self.mark_one(hash);
 		}
 	}
 
 	/// Mark all chunks as available
 	pub fn mark_all(&mut self) {
-		for (index, _) in self.hashes.iter().enumerate() {
-			self.completion.mark(index);
+		for (_, index) in self.hashes.iter() {
+			self.completion.mark(*index);
 		}
 	}
 }

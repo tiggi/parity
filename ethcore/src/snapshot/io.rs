@@ -323,6 +323,12 @@ impl LooseReader {
 			manifest: manifest,
 		})
 	}
+
+	/// Check if the given chunk is available (does not check its integrity)
+	pub fn has_chunk(&self, hash: H256) -> bool {
+		let path = self.dir.join(format!("{:x}", hash));
+		File::open(path).is_ok()
+	}
 }
 
 impl SnapshotReader for LooseReader {

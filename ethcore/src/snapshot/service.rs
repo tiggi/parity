@@ -69,31 +69,6 @@ pub trait DatabaseRestore: Send + Sync {
 	fn restore_db(&self, new_db: &str) -> Result<(), Error>;
 }
 
-/// I/O for Snapshot Restoration: a writer and a reader
-struct RestorationIo {
-	reader: LooseReader,
-	writer: LooseWriter,
-}
-
-impl RestorationIo {
-	/// Create a new Restoration I/O that will read and write from the given path
-	fn new(restoration_path: PathBuf, manifest: &ManifestData) -> Result<RestorationIo, Error> {
-		// Create the writer first, and write the Manifest file!
-		// Otherwise the reader will fail to read
-		// if the directory doesn't exist yet!
-		let writer = LooseWriter::new(restoration_path.clone())?;
-		writer.write_manifest(manifest.clone())?;
-		let reader = LooseReader::new(restoration_path.clone())?;
-
-		let io = RestorationIo {
-			reader,
-			writer,
-		};
-
-		Ok(io)
-	}
-}
-
 /// State restoration manager.
 struct Restoration {
 	manifest: ManifestData,
@@ -101,7 +76,7 @@ struct Restoration {
 	block_chunks_left: HashSet<H256>,
 	state: StateRebuilder,
 	secondary: Box<Rebuilder>,
-	io: Option<RestorationIo>,
+	writer: Option<LooseWriter>,
 	snappy_buffer: Bytes,
 	final_state_root: H256,
 	guard: Guard,
@@ -112,7 +87,7 @@ struct RestorationParams<'a> {
 	manifest: ManifestData, // manifest to base restoration on.
 	pruning: Algorithm, // pruning algorithm for the database.
 	db: Arc<KeyValueDB>, // database
-	io: Option<RestorationIo>, // IO (writer and reader) for recovered snapshot.
+	writer: Option<LooseWriter>, // writer for recovered snapshot.
 	genesis: &'a [u8], // genesis block of the chain.
 	guard: Guard, // guard for the restoration directory.
 	engine: &'a EthEngine,
@@ -142,7 +117,7 @@ impl Restoration {
 			block_chunks_left: block_chunks,
 			state: StateRebuilder::new(raw_db.clone(), params.pruning),
 			secondary: secondary,
-			io: params.io,
+			writer: params.writer,
 			snappy_buffer: Vec::new(),
 			final_state_root: root,
 			guard: params.guard,
@@ -150,7 +125,7 @@ impl Restoration {
 		})
 	}
 
-	// Fee a chunk, aborts early if `flag` becomes false
+	// Feed a chunk, aborts early if `flag` becomes false
 	fn feed_chunk(&mut self, hash: H256, chunk: &[u8], engine: &EthEngine, flag: &AtomicBool) -> Result<(), Error> {
 		let is_secondary = self.block_chunks_left.contains(&hash);
 		let is_state = self.state_chunks_left.contains(&hash);
@@ -169,11 +144,11 @@ impl Restoration {
 				self.secondary.feed(&self.snappy_buffer[..len], engine, flag)?;
 			}
 
-			if let Some(ref mut io) = self.io.as_mut() {
+			if let Some(ref mut writer) = self.writer.as_mut() {
 				if is_state {
-					io.writer.write_state_chunk(hash, chunk)?;
+					writer.write_state_chunk(hash, chunk)?;
 				} else {
-					io.writer.write_block_chunk(hash, chunk)?;
+					writer.write_block_chunk(hash, chunk)?;
 				}
 			}
 
@@ -206,8 +181,8 @@ impl Restoration {
 		// connect out-of-order chunks and verify chain integrity.
 		self.secondary.finalize(engine)?;
 
-		if let Some(io) = self.io {
-			io.writer.finish(self.manifest)?;
+		if let Some(writer) = self.writer {
+			writer.finish(self.manifest)?;
 		}
 
 		self.guard.disarm();
@@ -217,14 +192,6 @@ impl Restoration {
 	// is everything done?
 	fn is_done(&self) -> bool {
 		self.block_chunks_left.is_empty() && self.state_chunks_left.is_empty()
-	}
-
-	fn read_chunk(&self, hash: H256) -> Option<Bytes> {
-		if let Some(ref io) = self.io {
-			io.reader.chunk(hash).ok()
-		} else {
-			None
-		}
 	}
 }
 
@@ -250,6 +217,88 @@ pub struct ServiceParams {
 	pub db_restore: Arc<DatabaseRestore>,
 }
 
+/// A Snapshot representation (available chunks, manifest, ...)
+pub struct SnapshotInstance {
+	/// This Snapshot manifest
+	manifest: ManifestData,
+	/// This Snapshot Bitfield, ie. available and needed chunks
+	bitfield: Bitfield,
+	/// The Reader of of which chunks can be retrieved
+	reader: LooseReader,
+	/// The Manifest's hash
+	hash: H256,
+}
+
+impl SnapshotInstance {
+	/// Create a new Snapshot representation from the given path (where the manifest should be)
+	fn new(folder_path: PathBuf) -> Result<SnapshotInstance, Error> {
+		let reader = LooseReader::new(folder_path)?;
+		let manifest = reader.manifest().clone();
+		let hash = manifest.clone().hash();
+		let mut bitfield = Bitfield::new(&manifest);
+
+		// Update the Bitfield with all available chunks
+		for hash in manifest.state_hashes.iter().chain(manifest.block_hashes.iter()) {
+			if reader.has_chunk(*hash) {
+				bitfield.mark_one(hash);
+			}
+		}
+
+		Ok(SnapshotInstance {
+			bitfield: Bitfield::new(&manifest),
+			manifest,
+			reader,
+			hash,
+		})
+	}
+
+	/// Tries to read a chunk of this Snapshot, if available
+	fn chunk(&self, hash: H256) -> Option<Bytes> {
+		if self.bitfield.is_available(hash) {
+			self.reader.chunk(hash).ok()
+		} else {
+			None
+		}
+	}
+
+	/// Marks the given chunk as available
+	fn mark_chunk(&mut self, hash: &H256) {
+		self.bitfield.mark_one(hash);
+	}
+
+	/// Get the SnapshotReader of this Snapshot Instance
+	pub fn reader(&self) -> &LooseReader {
+		&self.reader
+	}
+
+	/// Get this Snapshots' instance Manifest Data
+	pub fn manifest(&self) -> &ManifestData {
+		&self.manifest
+	}
+}
+
+/// Keeps track of all available snapshots
+struct Snapshots {
+	/// The completed snapshot that is available from the FS
+	pub completed: Arc<RwLock<Option<SnapshotInstance>>>,
+	/// The Snapshot being restored, if any
+	pub partial: Arc<RwLock<Option<SnapshotInstance>>>,
+}
+
+impl Snapshots {
+	/// Creates a new empty set of snapshots
+	fn new() -> Snapshots {
+		Snapshots {
+			completed: Arc::new(RwLock::new(None)),
+			partial: Arc::new(RwLock::new(None)),
+		}
+	}
+
+	fn iter(&self) -> ::std::slice::Iter<&Arc<RwLock<Option<SnapshotInstance>>>> {
+		vec![&self.completed, &self.partial].iter()
+	}
+}
+
 /// `SnapshotService` implementation.
 /// This controls taking snapshots and restoring from them.
 pub struct Service {
@@ -259,7 +308,7 @@ pub struct Service {
 	io_channel: Mutex<Channel>,
 	pruning: Algorithm,
 	status: Mutex<RestorationStatus>,
-	reader: RwLock<Option<LooseReader>>,
+	snapshots: Snapshots,
 	engine: Arc<EthEngine>,
 	genesis_block: Bytes,
 	state_chunks: AtomicUsize,
@@ -273,14 +322,14 @@ pub struct Service {
 impl Service {
 	/// Create a new snapshot service from the given parameters.
 	pub fn new(params: ServiceParams) -> Result<Self, Error> {
-		let mut service = Service {
+		let service = Service {
 			restoration: Mutex::new(None),
 			restoration_db_handler: params.restoration_db_handler,
 			snapshot_root: params.snapshot_root,
 			io_channel: Mutex::new(params.channel),
 			pruning: params.pruning,
 			status: Mutex::new(RestorationStatus::Inactive),
-			reader: RwLock::new(None),
+			snapshots: Snapshots::new(),
 			engine: params.engine,
 			genesis_block: params.genesis_block,
 			state_chunks: AtomicUsize::new(0),
@@ -312,9 +361,7 @@ impl Service {
 			}
 		}
 
-		let reader = LooseReader::new(service.snapshot_dir()).ok();
-		*service.reader.get_mut() = reader;
-
+		*service.snapshots.completed.write() = SnapshotInstance::new(service.snapshot_dir()).ok();
 		Ok(service)
 	}
 
@@ -369,8 +416,8 @@ impl Service {
 	}
 
 	/// Get a reference to the snapshot reader.
-	pub fn reader(&self) -> RwLockReadGuard<Option<LooseReader>> {
-		self.reader.read()
+	pub fn instance(&self) -> RwLockReadGuard<Option<SnapshotInstance>> {
+		self.snapshots.completed.read()
 	}
 
 	/// Tick the snapshot service. This will log any active snapshot
@@ -421,10 +468,10 @@ impl Service {
 
 		info!("Finished taking snapshot at #{}", num);
 
-		let mut reader = self.reader.write();
+		let mut snapshot = self.snapshots.completed.write();
 
 		// destroy the old snapshot reader.
-		*reader = None;
+		*snapshot = None;
 
 		if snapshot_dir.exists() {
 			fs::remove_dir_all(&snapshot_dir)?;
@@ -432,7 +479,7 @@ impl Service {
 
 		fs::rename(temp_dir, &snapshot_dir)?;
 
-		*reader = Some(LooseReader::new(snapshot_dir)?);
+		*snapshot = Some(SnapshotInstance::new(snapshot_dir)?);
 
 		guard.disarm();
 		Ok(())
@@ -484,8 +531,8 @@ impl Service {
 		fs::create_dir_all(&rest_dir)?;
 
 		// make new restoration.
-		let restoration_io = match recover {
-			true => Some(RestorationIo::new(recovery_temp, &manifest)?),
+		let writer = match recover {
+			true => Some(LooseWriter::new(recovery_temp)?),
 			false => None
 		};
 
@@ -493,7 +540,7 @@ impl Service {
 			manifest: manifest.clone(),
 			pruning: self.pruning,
 			db: self.restoration_db_handler.open(&rest_db)?,
-			io: restoration_io,
+			writer: writer,
 			genesis: &self.genesis_block,
 			guard: Guard::new(rest_db),
 			engine: &*self.engine,
@@ -581,7 +628,7 @@ impl Service {
 	fn finalize_restoration(&self, rest: &mut Option<Restoration>) -> Result<(), Error> {
 		trace!(target: "snapshot", "finalizing restoration");
 
-		let recover = rest.as_ref().map_or(false, |rest| rest.io.is_some());
+		let recover = rest.as_ref().map_or(false, |rest| rest.writer.is_some());
 
 		// destroy the restoration before replacing databases and snapshot.
 		rest.take()
@@ -591,8 +638,8 @@ impl Service {
 		self.replace_client_db()?;
 
 		if recover {
-			let mut reader = self.reader.write();
-			*reader = None; // destroy the old reader if it existed.
+			let mut snapshot = self.snapshots.completed.write();
+			*snapshot = None;
 
 			let snapshot_dir = self.snapshot_dir();
 
@@ -604,7 +651,7 @@ impl Service {
 			trace!(target: "snapshot", "copying restored snapshot files over");
 			fs::rename(self.temp_recovery_dir(), &snapshot_dir)?;
 
-			*reader = Some(LooseReader::new(snapshot_dir)?);
+			*snapshot = Some(SnapshotInstance::new(snapshot_dir)?);
 		}
 
 		let _ = fs::remove_dir_all(self.restoration_dir());
@@ -615,7 +662,6 @@ impl Service {
 
 	/// Feed a chunk of either kind. no-op if no restoration or status is wrong.
 	fn feed_chunk(&self, hash: H256, chunk: &[u8], is_state: bool) -> Result<(), Error> {
-		// TODO: be able to process block chunks and state chunks at same time?
 		let mut restoration = self.restoration.lock();
 		self.feed_chunk_with_restoration(&mut restoration, hash, chunk, is_state)
 	}
@@ -635,12 +681,19 @@ impl Service {
 							None => return Ok(()),
 						};
 
-						(rest.feed_chunk(hash, chunk, &*self.engine, &self.restoring_snapshot)
-							.map(|_| rest.is_done()), rest.db.clone())
+						(
+							rest.feed_chunk(hash, chunk, &*self.engine, &self.restoring_snapshot)
+								.map(|_| rest.is_done()),
+							rest.db.clone()
+						)
 					};
 
 					let res = match res {
 						Ok(is_done) => {
+							// Update the bitfield of the partial Snapshot
+							if let Some(ref mut snap) = *self.snapshots.partial.write() {
+								snap.mark_chunk(&hash)
+							}
 							match is_state {
 								true => self.state_chunks.fetch_add(1, Ordering::SeqCst),
 								false => self.block_chunks.fetch_add(1, Ordering::SeqCst),
@@ -704,50 +757,40 @@ impl Service {
 			}
 		}
 	}
-
-	/// Get the completed Snapshot Manifest (if any), read from FS
-	fn completed_manifest(&self) -> Option<ManifestData> {
-		self.reader.read().as_ref().map(|r| r.manifest().clone())
-	}
-
-	/// Get the currently partially restored Snapshot Manifest (if any)
-	fn partial_manifest(&self) -> Option<ManifestData> {
-		let restoration = self.restoration.lock();
-
-		match *restoration {
-			Some(ref restoration) => {
-				trace!(target: "snapshot", "Returning partial Manifest ; {:?}", restoration.manifest.block_number);
-				Some(restoration.manifest.clone())
-			},
-			None => None,
-		}
-	}
 }
 
 impl SnapshotService for Service {
 	fn manifest(&self, support_partial: bool) -> Option<ManifestData> {
-		if support_partial {
-			match self.partial_manifest() {
-				Some(manifest) => return Some(manifest),
-				_ => (),
-			}
-		}
+		// Closure that returns the manifest of the given Snapshot Lock
+		let get_manifest = |snap_lock: &Arc<RwLock<Option<SnapshotInstance>>>| {
+			snap_lock.read().as_ref().map(|snap| snap.manifest().clone())
+		};
 
-		self.completed_manifest()
+		let first_manifest = if support_partial {
+			get_manifest(&self.snapshots.partial)
+		} else {
+			None
+		};
+
+		first_manifest.or_else(|| get_manifest(&self.snapshots.completed))
 	}
 
 	fn bitfield(&self, manifest_hash: H256) -> Option<Bitfield> {
-		if let Some(manifest) = self.completed_manifest() {
-			if manifest.clone().hash() != manifest_hash {
-				return None;
-			}
+		// Closure that returns the Bitfield of a Snapshot Lock if it's
+		// the correct Manifest hash
+		let get_bitfield = |snap_lock: &Arc<RwLock<Option<SnapshotInstance>>>| {
+			snap_lock.read().as_ref().and_then(|snap| {
+				if snap.hash == manifest_hash { Some(snap.bitfield.clone()) } else { None }
+			})
+		};
 
-			let mut bitfield = Bitfield::new(&manifest);
-			bitfield.mark_all();
-			Some(bitfield)
-		} else {
-			None
-		}
+		self.snapshots.iter().filter_map(|snap| get_bitfield(&snap))
+			.next()
+
+
+		// 	if let Some(bitfield)get_bitfield(&self.snapshots.partial)
+		// }
+		// 	.or_else(|| get_bitfield(&self.snapshots.completed))
 	}
 
 	fn supported_versions(&self) -> Option<(u64, u64)> {
@@ -756,20 +799,12 @@ impl SnapshotService for Service {
 	}
 
 	fn chunk(&self, hash: H256) -> Option<Bytes> {
-		let complete_chunk = self.reader.read().as_ref().and_then(|r| r.chunk(hash).ok());
+		let get_chunk = |snap_lock: &Arc<RwLock<Option<SnapshotInstance>>>| {
+			snap_lock.read().as_ref().and_then(|snap| snap.chunk(hash))
+		};
 
-		if complete_chunk.is_some() {
-			return complete_chunk;
-		}
-
-		let restoration = self.restoration.lock();
-
-		match *restoration {
-			Some(ref restoration) => {
-				restoration.read_chunk(hash)
-			},
-			None => None
-		}
+		get_chunk(&self.snapshots.completed)
+			.or_else(|| get_chunk(&self.snapshots.partial))
 	}
 
 	fn completed_chunks(&self) -> Option<Vec<H256>> {
