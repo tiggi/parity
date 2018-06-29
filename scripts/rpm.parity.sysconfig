@@ -1,0 +1,3 @@
+# Managed by ansible, don't edit
+PARITYOPTIONS="--tracing on --pruning archive --no-discovery"
+

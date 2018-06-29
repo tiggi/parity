@@ -1,0 +1,18 @@
+[Unit]
+Description=Parity Service
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/parity
+User=parity
+Group=parity
+Restart=on-abnormal
+ProtectSystem=full
+ProtectHome=true
+SyslogIdentifier=parity
+EnvironmentFile=-/etc/sysconfig/parity
+ExecStart=/usr/bin/parity $PARITYOPTIONS
+
+[Install]
+WantedBy=multi-user.target
