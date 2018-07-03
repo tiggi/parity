@@ -7,6 +7,8 @@ Group:		Applications/Internet
 License:	GPLv3
 URL:		http://www.github.com/parity/parity.git
 Source0:	parity-%{version}.tar.gz
+Source1:	https://raw.githubusercontent.com/tiggi/parity/rpm-package/scripts/rpm.parity.service
+Source2:	https://raw.githubusercontent.com/tiggi/parity/rpm-package/scripts/rpm.parity.sysconfig
 BuildRoot:      %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
 
@@ -27,8 +29,6 @@ echo "[target.$PLATFORM]" >> .cargo/config
 echo "linker= \"gcc\"" >> .cargo/config
 touch configure
 chmod 0755 configure
-wget https://raw.githubusercontent.com/tiggi/parity/rpm-package/scripts/rpm.parity.service
-wget https://raw.githubusercontent.com/tiggi/parity/rpm-package/scripts/rpm.parity.sysconfig
 
 
 %build
@@ -58,9 +58,10 @@ cp target/$PLATFORM/release/parity-evm $RPM_BUILD_ROOT/usr/bin/parity-evm
 cp target/$PLATFORM/release/ethstore $RPM_BUILD_ROOT/usr/bin/ethstore
 cp target/$PLATFORM/release/ethkey $RPM_BUILD_ROOT/usr/bin/ethkey
 cp target/$PLATFORM/release/whisper $RPM_BUILD_ROOT/usr/bin/whisper
-cp rpm.parity.service $RPM_BUILD_ROOT/usr/lib/systemd/system/parity.service
-cp rpm.parity.sysconfig $RPM_BUILD_ROOT/etc/sysconfig/parity
-
+cp %{SOURCE1} $RPM_BUILD_ROOT/usr/lib/systemd/system/parity.service
+cp %{SOURCE2} $RPM_BUILD_ROOT/etc/sysconfig/parity
+#cp rpm.parity.service $RPM_BUILD_ROOT/usr/lib/systemd/system/parity.service
+#cp rpm.parity.sysconfig $RPM_BUILD_ROOT/etc/sysconfig/parity
 
 %files
 %defattr(-,root,root,-)
