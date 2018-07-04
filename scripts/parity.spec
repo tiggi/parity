@@ -1,5 +1,5 @@
 Name:		parity
-Version:	1.11.4
+Version:	1.10.8
 Release:	1%{?dist}
 Summary:	Fast, light, and robust Ethereum client
 
@@ -11,9 +11,9 @@ Source1:	https://raw.githubusercontent.com/tiggi/parity/rpm-package/scripts/rpm.
 Source2:	https://raw.githubusercontent.com/tiggi/parity/rpm-package/scripts/rpm.parity.sysconfig
 BuildRoot:      %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 
-
-BuildRequires: rust, rhash
-Requires: openssl
+%{?systemd_requires}
+BuildRequires: rust, rhash, systemd
+Requires: openssl, systemd
 
 %description
 Fast, light, and robust Ethereum client
@@ -41,7 +41,7 @@ cargo build --target $PLATFORM --features final --release
 cargo build --target $PLATFORM --release -p evmbin
 cargo build --target $PLATFORM --release -p ethstore-cli
 cargo build --target $PLATFORM --release -p ethkey-cli
-cargo build --target $PLATFORM --release -p whisper-cli
+#cargo build --target $PLATFORM --release -p whisper-cli
 
 
 
@@ -57,11 +57,9 @@ cp target/$PLATFORM/release/parity $RPM_BUILD_ROOT/usr/bin/parity
 cp target/$PLATFORM/release/parity-evm $RPM_BUILD_ROOT/usr/bin/parity-evm
 cp target/$PLATFORM/release/ethstore $RPM_BUILD_ROOT/usr/bin/ethstore
 cp target/$PLATFORM/release/ethkey $RPM_BUILD_ROOT/usr/bin/ethkey
-cp target/$PLATFORM/release/whisper $RPM_BUILD_ROOT/usr/bin/whisper
+#cp target/$PLATFORM/release/whisper $RPM_BUILD_ROOT/usr/bin/whisper
 cp %{SOURCE1} $RPM_BUILD_ROOT/usr/lib/systemd/system/parity.service
 cp %{SOURCE2} $RPM_BUILD_ROOT/etc/sysconfig/parity
-#cp rpm.parity.service $RPM_BUILD_ROOT/usr/lib/systemd/system/parity.service
-#cp rpm.parity.sysconfig $RPM_BUILD_ROOT/etc/sysconfig/parity
 
 %files
 %defattr(-,root,root,-)
@@ -70,8 +68,18 @@ cp %{SOURCE2} $RPM_BUILD_ROOT/etc/sysconfig/parity
 %config /etc/sysconfig/parity
 %doc
 
+%post
+if $(/usr/bin/systemctl -q is-active parity.service) ; then
+/usr/bin/systemctl -q restart parity.service
+fi
+
+%postun
+if [ $1 -eq 0 ]; then
+/usr/bin/systemctl -q disable parity.service
+fi
+
 
 
 %changelog
-* Fri Jun 29 2018 Ulf Tigerstedt <tigerstedt@iki.fi> 1.11.4
+* Fri Jun 29 2018 Ulf Tigerstedt <tigerstedt@iki.fi> 1.10.8
 - Initial rpm spec file
